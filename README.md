@@ -40,6 +40,15 @@ uv run mistral-sentiment --days 7 --subreddit MistralAI --output output/weekly_s
 
 If `--output` is omitted, JSON is still printed to stdout.
 
+Optional date range mode (instead of trailing `--days`):
+
+```bash
+uv run mistral-sentiment --subreddit MistralAI --start-days-ago 14 --end-days-ago 7 --output output/range_14_to_7.json
+```
+
+- `--start-days-ago` is the older boundary.
+- `--end-days-ago` is the newer boundary (defaults to `0` when omitted).
+
 ## Keywords
 
 Edit `keywords.txt` to add or remove tracked terms. Use one term per line.

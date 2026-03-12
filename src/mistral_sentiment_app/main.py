@@ -49,7 +49,25 @@ def parse_args() -> argparse.Namespace:
         "--days",
         type=int,
         default=7,
-        help="Number of trailing days to analyze (default: 7)",
+        help="Number of trailing days to analyze when no explicit range is provided (default: 7)",
+    )
+    parser.add_argument(
+        "--start-days-ago",
+        type=int,
+        default=None,
+        help=(
+            "Optional range start in days ago (older boundary). "
+            "Example: 14 with --end-days-ago 7 analyzes content from 14 to 7 days ago."
+        ),
+    )
+    parser.add_argument(
+        "--end-days-ago",
+        type=int,
+        default=None,
+        help=(
+            "Optional range end in days ago (newer boundary). "
+            "Defaults to 0 when --start-days-ago is set."
+        ),
     )
     parser.add_argument(
         "--keywords-file",
@@ -88,6 +106,32 @@ def full_reddit_url(permalink: str) -> str:
     return f"{REDDIT_BASE_URL}{permalink}"
 
 
+def compute_window(args: argparse.Namespace) -> tuple[datetime, datetime, str]:
+    now = datetime.now(timezone.utc)
+
+    if args.start_days_ago is None and args.end_days_ago is None:
+        if args.days < 1:
+            raise RuntimeError("--days must be >= 1")
+        start = now - timedelta(days=args.days)
+        end = now
+        return start, end, f"last {args.days} days"
+
+    if args.start_days_ago is None:
+        raise RuntimeError("--start-days-ago is required when --end-days-ago is provided")
+
+    start_days_ago = args.start_days_ago
+    end_days_ago = 0 if args.end_days_ago is None else args.end_days_ago
+
+    if start_days_ago < 0 or end_days_ago < 0:
+        raise RuntimeError("--start-days-ago and --end-days-ago must be >= 0")
+    if start_days_ago < end_days_ago:
+        raise RuntimeError("--start-days-ago must be >= --end-days-ago")
+
+    start = now - timedelta(days=start_days_ago)
+    end = now - timedelta(days=end_days_ago)
+    return start, end, f"from {start_days_ago} to {end_days_ago} days ago"
+
+
 def _public_reddit_get(path: str, params: dict, user_agent: str) -> dict:
     url = f"https://www.reddit.com{path}"
     response = requests.get(
@@ -103,6 +147,7 @@ def _public_reddit_get(path: str, params: dict, user_agent: str) -> dict:
 def fetch_weekly_posts_public(
     subreddit_name: str,
     since_utc: float,
+    until_utc: float,
     post_limit: int,
     user_agent: str,
 ) -> list[PostRecord]:
@@ -122,13 +167,15 @@ def fetch_weekly_posts_public(
         if not children:
             break
 
-        saw_newer = False
+        oldest_created = float("inf")
         for child in children:
             item = child.get("data", {})
             created_utc = float(item.get("created_utc", 0.0))
-            if created_utc < since_utc:
+            oldest_created = min(oldest_created, created_utc)
+
+            if created_utc < since_utc or created_utc > until_utc:
                 continue
-            saw_newer = True
+
             records.append(
                 PostRecord(
                     id=item.get("id", ""),
@@ -147,9 +194,8 @@ def fetch_weekly_posts_public(
         if not after:
             break
 
-        # /new is reverse-chronological, so once a page has no in-window items,
-        # subsequent pages are older and can be skipped.
-        if not saw_newer:
+        # Listings are newest to oldest. Stop after we pass the older boundary.
+        if oldest_created < since_utc:
             break
 
     return records
@@ -158,6 +204,7 @@ def fetch_weekly_posts_public(
 def fetch_weekly_comments_public(
     subreddit_name: str,
     since_utc: float,
+    until_utc: float,
     comment_limit: int,
     user_agent: str,
 ) -> list[CommentRecord]:
@@ -177,18 +224,19 @@ def fetch_weekly_comments_public(
         if not children:
             break
 
-        saw_newer = False
+        oldest_created = float("inf")
         for child in children:
             item = child.get("data", {})
             created_utc = float(item.get("created_utc", 0.0))
-            if created_utc < since_utc:
+            oldest_created = min(oldest_created, created_utc)
+
+            if created_utc < since_utc or created_utc > until_utc:
                 continue
 
             body = (item.get("body", "") or "").strip()
             if not body or body in {"[deleted]", "[removed]"}:
                 continue
 
-            saw_newer = True
             records.append(
                 CommentRecord(
                     id=item.get("id", ""),
@@ -206,7 +254,7 @@ def fetch_weekly_comments_public(
         if not after:
             break
 
-        if not saw_newer:
+        if oldest_created < since_utc:
             break
 
     return records
@@ -313,7 +361,7 @@ def analyze_with_claude(
     posts: list[PostRecord],
     comments: list[CommentRecord],
     subreddit_name: str,
-    days: int,
+    window_label: str,
 ) -> dict:
     api_key = get_required_env("ANTHROPIC_API_KEY")
     model = os.getenv("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL)
@@ -337,7 +385,7 @@ def analyze_with_claude(
         "task": "Analyze sentiment around MistralAI and its products from subreddit data.",
         "scope": {
             "subreddit": subreddit_name,
-            "window_days": days,
+            "window": window_label,
         },
         "sentiment_scale": sentiment_scale,
         "requirements": {
@@ -382,21 +430,23 @@ def analyze_with_claude(
 
 def build_result(
     subreddit_name: str,
-    days: int,
+    window_start: datetime,
+    window_end: datetime,
+    window_label: str,
     posts: list[PostRecord],
     comments: list[CommentRecord],
     sentiment: dict,
     mentions: dict[str, dict],
 ) -> dict:
-    now = datetime.now(timezone.utc)
-    since = now - timedelta(days=days)
+    duration_days = (window_end - window_start).total_seconds() / 86400
 
     return {
         "subreddit": subreddit_name,
         "window": {
-            "days": days,
-            "start_utc": since.isoformat(),
-            "end_utc": now.isoformat(),
+            "label": window_label,
+            "days": round(duration_days, 3),
+            "start_utc": window_start.isoformat(),
+            "end_utc": window_end.isoformat(),
         },
         "counts": {
             "posts": len(posts),
@@ -417,14 +467,10 @@ def main() -> None:
     reddit_post_limit = int(os.getenv("REDDIT_POST_LIMIT", "300"))
     reddit_comment_limit = int(os.getenv("REDDIT_COMMENT_LIMIT", "1500"))
 
-    if args.days < 1:
-        raise RuntimeError("--days must be >= 1")
-
     keywords = load_keywords(Path(args.keywords_file))
-
-    now = datetime.now(timezone.utc)
-    since = now - timedelta(days=args.days)
-    since_utc = since.timestamp()
+    window_start, window_end, window_label = compute_window(args)
+    since_utc = window_start.timestamp()
+    until_utc = window_end.timestamp()
 
     public_user_agent = (
         os.getenv("REDDIT_USER_AGENT", "").strip() or DEFAULT_PUBLIC_REDDIT_USER_AGENT
@@ -432,12 +478,14 @@ def main() -> None:
     posts = fetch_weekly_posts_public(
         subreddit_name=args.subreddit,
         since_utc=since_utc,
+        until_utc=until_utc,
         post_limit=reddit_post_limit,
         user_agent=public_user_agent,
     )
     comments = fetch_weekly_comments_public(
         subreddit_name=args.subreddit,
         since_utc=since_utc,
+        until_utc=until_utc,
         comment_limit=reddit_comment_limit,
         user_agent=public_user_agent,
     )
@@ -447,12 +495,14 @@ def main() -> None:
         posts=posts,
         comments=comments,
         subreddit_name=args.subreddit,
-        days=args.days,
+        window_label=window_label,
     )
 
     result = build_result(
         subreddit_name=args.subreddit,
-        days=args.days,
+        window_start=window_start,
+        window_end=window_end,
+        window_label=window_label,
         posts=posts,
         comments=comments,
         sentiment=sentiment,
