@@ -13,7 +13,7 @@ from mistral_sentiment_app.google_sheets_export import (
     DEFAULT_SUMMARY_WORKSHEET,
     write_results_to_google_sheets,
 )
-from mistral_sentiment_app.llm_analysis import DEFAULT_LLM_PROVIDER, analyze_sentiment
+from mistral_sentiment_app.llm_analysis import DEFAULT_ANALYSIS_TOPIC, DEFAULT_LLM_PROVIDER, analyze_sentiment
 from mistral_sentiment_app.models import CommentRecord, PostRecord
 
 REDDIT_BASE_URL = "https://www.reddit.com"
@@ -31,6 +31,7 @@ class AnalysisOptions:
     start_date: str | None = None
     end_date: str | None = None
     keywords_file: str = "keywords.txt"
+    topic: str = DEFAULT_ANALYSIS_TOPIC
     provider: str = DEFAULT_LLM_PROVIDER
     model_override: str = ""
     reddit_post_limit: int = 300
@@ -107,14 +108,22 @@ def compute_window(options: AnalysisOptions) -> tuple[datetime, datetime, str]:
     return start, end, f"from {start_days_ago} to {end_days_ago} days ago"
 
 
+def _parse_keyword_lines(lines: Iterable[str]) -> list[str]:
+    return [
+        kw for raw in lines if (kw := raw.strip()) and not kw.startswith("#")
+    ]
+
+
 def load_keywords(path: Path) -> list[str]:
+    env_value = os.getenv("KEYWORDS", "").strip()
+    if env_value:
+        keywords = _parse_keyword_lines(env_value.splitlines())
+        if keywords:
+            return keywords
+
     if not path.exists():
         raise FileNotFoundError(f"Keyword file not found: {path}")
-    keywords: list[str] = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        keyword = raw.strip()
-        if keyword and not keyword.startswith("#"):
-            keywords.append(keyword)
+    keywords = _parse_keyword_lines(path.read_text(encoding="utf-8").splitlines())
     if not keywords:
         raise RuntimeError("No keywords found in keywords file.")
     return keywords
@@ -363,6 +372,7 @@ def run_analysis(options: AnalysisOptions) -> dict:
         window_label=window_label,
         provider=options.provider,
         model_override=options.model_override,
+        topic=options.topic,
     )
     result = build_result(
         subreddit_name=options.subreddit,

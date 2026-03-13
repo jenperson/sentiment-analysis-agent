@@ -10,7 +10,7 @@ from mistral_sentiment_app.google_sheets_export import (
     DEFAULT_KEYWORDS_WORKSHEET,
     DEFAULT_SUMMARY_WORKSHEET,
 )
-from mistral_sentiment_app.llm_analysis import DEFAULT_LLM_PROVIDER
+from mistral_sentiment_app.llm_analysis import DEFAULT_ANALYSIS_TOPIC, DEFAULT_LLM_PROVIDER
 from mistral_sentiment_app.service import (
     AnalysisOptions,
     DEFAULT_PUBLIC_REDDIT_USER_AGENT,
@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
         description="Analyze weekly subreddit sentiment for MistralAI and products."
     )
     parser.add_argument("--subreddit", default=DEFAULT_SUBREDDIT)
+    parser.add_argument("--topic", default=DEFAULT_ANALYSIS_TOPIC)
     parser.add_argument("--days", type=int, default=7)
     parser.add_argument("--start-days-ago", type=int, default=None)
     parser.add_argument("--end-days-ago", type=int, default=None)
@@ -75,6 +76,7 @@ def build_options(args: argparse.Namespace) -> AnalysisOptions:
         start_date=args.start_date,
         end_date=args.end_date,
         keywords_file=args.keywords_file,
+        topic=args.topic,
         provider=args.provider,
         model_override=args.model,
         reddit_post_limit=int(os.getenv("REDDIT_POST_LIMIT", "300")),

@@ -10,7 +10,7 @@ from mistral_sentiment_app.google_sheets_export import (
     DEFAULT_KEYWORDS_WORKSHEET,
     DEFAULT_SUMMARY_WORKSHEET,
 )
-from mistral_sentiment_app.llm_analysis import DEFAULT_LLM_PROVIDER
+from mistral_sentiment_app.llm_analysis import DEFAULT_ANALYSIS_TOPIC, DEFAULT_LLM_PROVIDER
 from mistral_sentiment_app.service import (
     AnalysisOptions,
     DEFAULT_PUBLIC_REDDIT_USER_AGENT,
@@ -37,6 +37,7 @@ def analyze_mistral_subreddit(
     start_date: str | None = None,
     end_date: str | None = None,
     keywords_file: str = "keywords.txt",
+    topic: str = DEFAULT_ANALYSIS_TOPIC,
     provider: str = DEFAULT_LLM_PROVIDER,
     model: str = "",
     write_google_sheets: bool = False,
@@ -53,6 +54,7 @@ def analyze_mistral_subreddit(
         start_date=start_date,
         end_date=end_date,
         keywords_file=keywords_file,
+        topic=topic,
         provider=provider,
         model_override=model,
         reddit_post_limit=int(os.getenv("REDDIT_POST_LIMIT", "300")),

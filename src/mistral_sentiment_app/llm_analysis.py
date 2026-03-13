@@ -11,6 +11,7 @@ from mistral_sentiment_app.models import CommentRecord, PostRecord
 DEFAULT_LLM_PROVIDER = "mistral"
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_MISTRAL_MODEL = "mistral-medium-2508"
+DEFAULT_ANALYSIS_TOPIC = "Mistral AI and its products"
 MISTRAL_CHAT_COMPLETIONS_URL = "https://api.mistral.ai/v1/chat/completions"
 
 
@@ -75,6 +76,7 @@ def build_analysis_prompt(
     comments: list[CommentRecord],
     subreddit_name: str,
     window_label: str,
+    topic: str = DEFAULT_ANALYSIS_TOPIC,
 ) -> tuple[str, str]:
     dataset = serialize_for_analysis(posts, comments)
     sentiment_scale = {
@@ -87,7 +89,7 @@ def build_analysis_prompt(
 
     system_prompt = "You are a precise sentiment analyst. Return strict JSON only with no markdown."
     user_prompt = {
-        "task": "Analyze sentiment around MistralAI and its products from subreddit data.",
+        "task": f"Analyze sentiment around {topic} from subreddit data.",
         "scope": {
             "subreddit": subreddit_name,
             "window": window_label,
@@ -121,7 +123,7 @@ def extract_json_object(text: str) -> dict:
     return json.loads(match.group(0))
 
 
-def extract_mistral_text(content: str | list[dict] | None) -> str:
+def extract_text_content(content: str | list[dict] | None) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -182,7 +184,7 @@ def analyze_with_mistral(system_prompt: str, user_prompt: str, model: str) -> di
         raise RuntimeError("Mistral response did not include any choices.")
 
     content = choices[0].get("message", {}).get("content")
-    parsed = extract_json_object(extract_mistral_text(content))
+    parsed = extract_json_object(extract_text_content(content))
     if "average_sentiment" not in parsed or "summary" not in parsed:
         raise RuntimeError("Mistral response missing required fields.")
     return parsed
@@ -195,6 +197,7 @@ def analyze_sentiment(
     window_label: str,
     provider: str,
     model_override: str,
+    topic: str = DEFAULT_ANALYSIS_TOPIC,
 ) -> tuple[dict, str, str]:
     resolved_provider, resolved_model = resolve_analysis_config(provider, model_override)
     system_prompt, user_prompt = build_analysis_prompt(
@@ -202,6 +205,7 @@ def analyze_sentiment(
         comments=comments,
         subreddit_name=subreddit_name,
         window_label=window_label,
+        topic=topic,
     )
 
     if resolved_provider == "mistral":
