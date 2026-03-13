@@ -6,13 +6,18 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "anthropic>=0.52.0",
+  "fastapi>=0.116.0",
+  "fastmcp>=2.13.0",
   "gspread>=6.1.2",
   "python-dotenv>=1.1.0",
   "requests>=2.32.0",
+  "uvicorn>=0.35.0",
 ]
 
 [project.scripts]
 mistral-sentiment = "mistral_sentiment_app.main:main"
+mistral-sentiment-api = "mistral_sentiment_app.api:run"
+mistral-sentiment-mcp = "mistral_sentiment_app.mcp_server:run"
 
 [build-system]
 requires = ["hatchling>=1.25.0"]

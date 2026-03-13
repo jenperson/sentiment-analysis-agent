@@ -8,6 +8,12 @@ This app fetches Reddit posts and comments from `r/MistralAI`, sends the dataset
 - Keyword mention counts and links to mentions
 - Optional Google Sheets export
 
+The workspace now supports three ways to run the same analysis logic:
+
+- CLI
+- FastAPI
+- MCP server
+
 ## Requirements
 
 - Python 3.11+
@@ -58,6 +64,31 @@ uv run mistral-sentiment --days 7 --subreddit MistralAI --output output/weekly_s
 
 If `--output` is omitted, JSON is still printed to stdout.
 
+Run the FastAPI server:
+
+```bash
+uv run mistral-sentiment-api
+```
+
+Default API endpoint:
+
+- `GET /health`
+- `POST /analyze`
+
+Run the MCP server over stdio:
+
+```bash
+uv run mistral-sentiment-mcp
+```
+
+Run the MCP server over HTTP:
+
+```bash
+MCP_TRANSPORT=http MCP_PORT=8001 uv run mistral-sentiment-mcp
+```
+
+The HTTP MCP endpoint is served at `/mcp`.
+
 Default analysis provider and model:
 
 - Provider: `mistral`
@@ -100,6 +131,20 @@ uv run mistral-sentiment --subreddit MistralAI --start-date 2026-03-01 --end-dat
 - `--start-date` and `--end-date` are inclusive UTC dates in `YYYY-MM-DD` format.
 - If `--end-date` is omitted, the app uses the same date as `--start-date`.
 
+FastAPI request body fields mirror the CLI options, including:
+
+- `subreddit`
+- `days`
+- `start_days_ago`
+- `end_days_ago`
+- `date`
+- `start_date`
+- `end_date`
+- `keywords_file`
+- `provider`
+- `model`
+- `write_google_sheets`
+
 Google Sheets worksheets used by default:
 
 - `sentiment_summary`
@@ -131,6 +176,137 @@ Expected columns for `keyword_mentions`:
 - `keyword`
 - `count`
 - `links_json`
+
+## MCP usage
+
+### What is MCP?
+
+The Model Context Protocol (MCP) lets AI assistants (Claude Desktop, VS Code Copilot, Cursor, etc.) call your tools directly as part of a conversation. There are two transport modes:
+
+- **stdio** — The client launches the server as a local subprocess and communicates through stdin/stdout. Good for local development.
+- **HTTP (streamable HTTP)** — The server runs on a network endpoint and the client connects by URL. Required for remote/cloud deployments like Koyeb.
+
+### Connect via stdio (local, Claude Desktop example)
+
+Add this to your `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "mistral-sentiment": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/mistral-dev-sentiment", "mistral-sentiment-mcp"],
+      "env": {
+        "MISTRAL_API_KEY": "your-key-here"
+      }
+    }
+  }
+}
+```
+
+Then ask Claude: _"Run a sentiment analysis on r/MistralAI for the past 7 days."_
+
+### Connect via stdio (VS Code / Copilot)
+
+Add to `.vscode/mcp.json` (or user-level MCP config):
+
+```json
+{
+  "servers": {
+    "mistral-sentiment": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/mistral-dev-sentiment", "mistral-sentiment-mcp"],
+      "env": {
+        "MISTRAL_API_KEY": "your-key-here"
+      }
+    }
+  }
+}
+```
+
+### Connect via HTTP (deployed on Koyeb)
+
+Once deployed, a remote MCP client connects by URL. Add to your MCP client config:
+
+```json
+{
+  "servers": {
+    "mistral-sentiment": {
+      "type": "http",
+      "url": "https://your-service.koyeb.app/mcp",
+      "headers": {
+        "Authorization": "Bearer your-mcp-api-key-here"
+      }
+    }
+  }
+}
+```
+
+If `MCP_API_KEY` is not set on the server, the `headers` block can be omitted.
+
+For VS Code Copilot the key is `"type": "http"` and the URL points to the `/mcp` path.
+
+### Tool: `analyze_mistral_subreddit`
+
+The MCP server exposes one tool. All parameters are optional:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `subreddit` | string | `MistralAI` | Subreddit to analyze |
+| `days` | integer | `7` | Trailing window in days |
+| `start_days_ago` | integer | — | Older boundary (relative) |
+| `end_days_ago` | integer | — | Newer boundary (relative) |
+| `date` | string | — | Single UTC date `YYYY-MM-DD` |
+| `start_date` | string | — | Start of UTC date range |
+| `end_date` | string | — | End of UTC date range |
+| `provider` | string | `mistral` | `mistral` or `claude` |
+| `model` | string | — | Override the default model |
+| `write_google_sheets` | boolean | `false` | Append results to Google Sheets |
+
+Example prompts for an AI assistant:
+
+- _"Analyze r/MistralAI sentiment for the last 7 days."_
+- _"What was the sentiment in r/MistralAI from 2026-03-01 to 2026-03-07?"_
+- _"Run sentiment analysis on r/MistralAI for the past two weeks and write to Google Sheets."_
+
+## Docker
+
+### API key protection
+
+Both servers support optional API key protection. Set the env var to enable it; leave it unset to run without auth (development).
+
+| Server | Env var | Header |
+|---|---|---|
+| FastAPI | `API_KEY` | `X-API-Key: <value>` |
+| MCP HTTP | `MCP_API_KEY` | `Authorization: Bearer <value>` |
+
+Example call to the FastAPI endpoint with auth:
+
+```bash
+curl -X POST https://your-service.koyeb.app/analyze \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"subreddit": "MistralAI", "days": 7}'
+```
+
+`/health` is always unauthenticated so Koyeb health checks work.
+
+### Build and run the FastAPI service
+
+```bash
+docker build -f Dockerfile.api -t mistral-sentiment-api .
+docker run --env-file .env -p 8000:8000 mistral-sentiment-api
+```
+
+### Build and run the MCP HTTP server
+
+```bash
+docker build -f Dockerfile.mcp -t mistral-sentiment-mcp .
+docker run --env-file .env -p 8001:8001 mistral-sentiment-mcp
+```
+
+Both images read all configuration from environment variables. On Koyeb, set your secrets in the service environment settings and Koyeb injects `PORT` automatically.
 
 ## Keywords
 

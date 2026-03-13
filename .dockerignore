@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.git/
+.gitignore
+dist/
+build/
+*.egg-info/
+output/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.md

@@ -1,0 +1,25 @@
+FROM python:3.11-slim
+
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+WORKDIR /app
+
+# Copy dependency files first for layer caching
+COPY pyproject.toml uv.lock ./
+
+# Install dependencies into the system Python (no venv needed in container)
+RUN uv sync --frozen --no-dev --no-install-project
+
+# Copy source code
+COPY src/ ./src/
+COPY keywords.txt ./
+
+# Install the project itself
+RUN uv sync --frozen --no-dev
+
+# Koyeb (and most PaaS) injects PORT; api.py already reads it via os.getenv("PORT")
+ENV PORT=8000
+EXPOSE 8000
+
+CMD ["uv", "run", "mistral-sentiment-api"]
