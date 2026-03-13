@@ -1,7 +1,7 @@
 [project]
 name = "mistral-reddit-sentiment"
 version = "0.1.0"
-description = "Weekly sentiment analysis for r/MistralAI using Reddit + Claude"
+description = "Weekly sentiment analysis for r/MistralAI using Reddit and selectable LLM providers"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

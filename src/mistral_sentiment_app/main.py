@@ -3,37 +3,18 @@ import json
 import os
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
-from anthropic import Anthropic
 from dotenv import load_dotenv
+
+from mistral_sentiment_app.llm_analysis import DEFAULT_LLM_PROVIDER, analyze_sentiment
+from mistral_sentiment_app.models import CommentRecord, PostRecord
 
 REDDIT_BASE_URL = "https://www.reddit.com"
 DEFAULT_SUBREDDIT = "MistralAI"
-DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
 DEFAULT_PUBLIC_REDDIT_USER_AGENT = "mistral-weekly-sentiment/0.1"
-
-
-@dataclass
-class PostRecord:
-    id: str
-    title: str
-    body: str
-    score: int
-    created_utc: float
-    permalink: str
-
-
-@dataclass
-class CommentRecord:
-    id: str
-    body: str
-    score: int
-    created_utc: float
-    permalink: str
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,14 +60,18 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional output JSON path. If omitted, prints to stdout only.",
     )
+    parser.add_argument(
+        "--provider",
+        choices=["mistral", "claude"],
+        default=os.getenv("LLM_PROVIDER", DEFAULT_LLM_PROVIDER),
+        help="LLM provider for sentiment analysis (default: mistral)",
+    )
+    parser.add_argument(
+        "--model",
+        default=os.getenv("LLM_MODEL", ""),
+        help="Optional model override for the selected provider",
+    )
     return parser.parse_args()
-
-
-def get_required_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
 
 
 def load_keywords(path: Path) -> list[str]:
@@ -309,125 +294,6 @@ def keyword_mentions(
     return matches
 
 
-def serialize_for_claude(posts: list[PostRecord], comments: list[CommentRecord]) -> dict:
-    # Limit payload size to stay within practical context windows while preserving variety.
-    max_items = int(os.getenv("CLAUDE_MAX_ITEMS", "250"))
-    max_chars = int(os.getenv("CLAUDE_MAX_CHARS_PER_ITEM", "1200"))
-
-    serialized_posts = []
-    for p in sorted(posts, key=lambda x: x.score, reverse=True)[:max_items]:
-        serialized_posts.append(
-            {
-                "type": "post",
-                "id": p.id,
-                "score": p.score,
-                "link": p.permalink,
-                "text": (f"Title: {p.title}\nBody: {p.body}")[:max_chars],
-            }
-        )
-
-    serialized_comments = []
-    for c in sorted(comments, key=lambda x: x.score, reverse=True)[:max_items]:
-        serialized_comments.append(
-            {
-                "type": "comment",
-                "id": c.id,
-                "score": c.score,
-                "link": c.permalink,
-                "text": c.body[:max_chars],
-            }
-        )
-
-    return {
-        "posts": serialized_posts,
-        "comments": serialized_comments,
-    }
-
-
-def extract_json_object(text: str) -> dict:
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not match:
-        raise RuntimeError("Claude response did not contain JSON.")
-    return json.loads(match.group(0))
-
-
-def analyze_with_claude(
-    posts: list[PostRecord],
-    comments: list[CommentRecord],
-    subreddit_name: str,
-    window_label: str,
-) -> dict:
-    api_key = get_required_env("ANTHROPIC_API_KEY")
-    model = os.getenv("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL)
-    client = Anthropic(api_key=api_key)
-
-    sentiment_scale = {
-        "1": "Very negative, someone is beyond frustrated and unhappy with the brand or products",
-        "2": "Somewhat negative, someone is not having a good experience and is expressing frustration, but not hatred",
-        "3": "Neutral, someone has a mix of positive and negative things to say leading to a balance, or does not express strong feelings one way or another",
-        "4": "Somewhat positive, someone expresses satisfaction with the product or uses it successfully",
-        "5": "Very positive, someone is praising the product, and may want to convince others to use it",
-    }
-
-    dataset = serialize_for_claude(posts, comments)
-
-    system_prompt = (
-        "You are a precise sentiment analyst. Return strict JSON only with no markdown."
-    )
-
-    user_prompt = {
-        "task": "Analyze sentiment around MistralAI and its products from subreddit data.",
-        "scope": {
-            "subreddit": subreddit_name,
-            "window": window_label,
-        },
-        "sentiment_scale": sentiment_scale,
-        "requirements": {
-            "average_sentiment": "Number from 1 to 5, can include decimals.",
-            "summary": "Brief summary of major themes this week (3-8 sentences).",
-            "method_notes": "Very short explanation of how the score was determined.",
-        },
-        "output_schema": {
-            "average_sentiment": "float",
-            "summary": "string",
-            "method_notes": "string",
-        },
-        "data": dataset,
-    }
-
-    response = client.messages.create(
-        model=model,
-        max_tokens=1800,
-        temperature=0,
-        system=system_prompt,
-        messages=[
-            {
-                "role": "user",
-                "content": json.dumps(user_prompt),
-            }
-        ],
-    )
-
-    text_chunks = []
-    for block in response.content:
-        if getattr(block, "type", "") == "text":
-            text_chunks.append(block.text)
-
-    raw_text = "\n".join(text_chunks).strip()
-    parsed = extract_json_object(raw_text)
-
-    if "average_sentiment" not in parsed or "summary" not in parsed:
-        raise RuntimeError("Claude response missing required fields.")
-
-    return parsed
-
-
 def build_result(
     subreddit_name: str,
     window_start: datetime,
@@ -437,6 +303,8 @@ def build_result(
     comments: list[CommentRecord],
     sentiment: dict,
     mentions: dict[str, dict],
+    analysis_provider: str,
+    analysis_model: str,
 ) -> dict:
     duration_days = (window_end - window_start).total_seconds() / 86400
 
@@ -451,6 +319,10 @@ def build_result(
         "counts": {
             "posts": len(posts),
             "comments": len(comments),
+        },
+        "analysis": {
+            "provider": analysis_provider,
+            "model": analysis_model,
         },
         "average_sentiment": sentiment["average_sentiment"],
         "summary_of_week": sentiment["summary"],
@@ -491,11 +363,13 @@ def main() -> None:
     )
 
     mentions = keyword_mentions(keywords=keywords, posts=posts, comments=comments)
-    sentiment = analyze_with_claude(
+    sentiment, analysis_provider, analysis_model = analyze_sentiment(
         posts=posts,
         comments=comments,
         subreddit_name=args.subreddit,
         window_label=window_label,
+        provider=args.provider,
+        model_override=args.model,
     )
 
     result = build_result(
@@ -507,6 +381,8 @@ def main() -> None:
         comments=comments,
         sentiment=sentiment,
         mentions=mentions,
+        analysis_provider=analysis_provider,
+        analysis_model=analysis_model,
     )
 
     output = json.dumps(result, indent=2)
