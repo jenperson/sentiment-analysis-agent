@@ -9,12 +9,25 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from mistral_sentiment_app.google_sheets_export import (
+    DEFAULT_GOOGLE_SHEETS_SPREADSHEET_ID,
+    DEFAULT_KEYWORDS_WORKSHEET,
+    DEFAULT_SUMMARY_WORKSHEET,
+    write_results_to_google_sheets,
+)
 from mistral_sentiment_app.llm_analysis import DEFAULT_LLM_PROVIDER, analyze_sentiment
 from mistral_sentiment_app.models import CommentRecord, PostRecord
 
 REDDIT_BASE_URL = "https://www.reddit.com"
 DEFAULT_SUBREDDIT = "MistralAI"
 DEFAULT_PUBLIC_REDDIT_USER_AGENT = "mistral-weekly-sentiment/0.1"
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,6 +64,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--date",
+        default=None,
+        help="Specific UTC date to analyze in YYYY-MM-DD format.",
+    )
+    parser.add_argument(
+        "--start-date",
+        default=None,
+        help="Inclusive UTC start date in YYYY-MM-DD format.",
+    )
+    parser.add_argument(
+        "--end-date",
+        default=None,
+        help="Inclusive UTC end date in YYYY-MM-DD format. Defaults to --start-date when omitted.",
+    )
+    parser.add_argument(
         "--keywords-file",
         default="keywords.txt",
         help="Path to newline-delimited keyword file",
@@ -70,6 +98,27 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default=os.getenv("LLM_MODEL", ""),
         help="Optional model override for the selected provider",
+    )
+    parser.add_argument(
+        "--write-google-sheets",
+        action="store_true",
+        default=env_flag("GOOGLE_SHEETS_WRITE", default=False),
+        help="Append the run results to Google Sheets",
+    )
+    parser.add_argument(
+        "--google-sheets-spreadsheet-id",
+        default=os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", DEFAULT_GOOGLE_SHEETS_SPREADSHEET_ID),
+        help="Spreadsheet ID for Google Sheets export",
+    )
+    parser.add_argument(
+        "--google-sheets-summary-worksheet",
+        default=os.getenv("GOOGLE_SHEETS_SUMMARY_WORKSHEET", DEFAULT_SUMMARY_WORKSHEET),
+        help="Worksheet name for summary and sentiment data",
+    )
+    parser.add_argument(
+        "--google-sheets-keywords-worksheet",
+        default=os.getenv("GOOGLE_SHEETS_KEYWORDS_WORKSHEET", DEFAULT_KEYWORDS_WORKSHEET),
+        help="Worksheet name for keyword mention data",
     )
     return parser.parse_args()
 
@@ -91,8 +140,43 @@ def full_reddit_url(permalink: str) -> str:
     return f"{REDDIT_BASE_URL}{permalink}"
 
 
+def parse_utc_date(date_text: str, argument_name: str) -> datetime:
+    try:
+        parsed = datetime.strptime(date_text, "%Y-%m-%d")
+    except ValueError as exc:
+        raise RuntimeError(f"{argument_name} must be in YYYY-MM-DD format") from exc
+    return parsed.replace(tzinfo=timezone.utc)
+
+
 def compute_window(args: argparse.Namespace) -> tuple[datetime, datetime, str]:
     now = datetime.now(timezone.utc)
+
+    has_day_range = args.start_days_ago is not None or args.end_days_ago is not None
+    has_date_range = any(value is not None for value in (args.date, args.start_date, args.end_date))
+
+    if args.date is not None and (args.start_date is not None or args.end_date is not None):
+        raise RuntimeError("Use either --date or --start-date/--end-date, not both")
+
+    if has_date_range and has_day_range:
+        raise RuntimeError(
+            "Choose either day-based filters (--start-days-ago/--end-days-ago) or date-based filters (--date/--start-date/--end-date)"
+        )
+
+    if args.date is not None:
+        start = parse_utc_date(args.date, "--date")
+        end = start + timedelta(days=1) - timedelta(microseconds=1)
+        return start, end, f"on {args.date}"
+
+    if args.start_date is not None or args.end_date is not None:
+        if args.start_date is None:
+            raise RuntimeError("--start-date is required when --end-date is provided")
+
+        start = parse_utc_date(args.start_date, "--start-date")
+        end_date = args.start_date if args.end_date is None else args.end_date
+        end = parse_utc_date(end_date, "--end-date") + timedelta(days=1) - timedelta(microseconds=1)
+        if start > end:
+            raise RuntimeError("--start-date must be on or before --end-date")
+        return start, end, f"from {args.start_date} to {end_date}"
 
     if args.start_days_ago is None and args.end_days_ago is None:
         if args.days < 1:
@@ -384,6 +468,14 @@ def main() -> None:
         analysis_provider=analysis_provider,
         analysis_model=analysis_model,
     )
+
+    if args.write_google_sheets:
+        result["google_sheets_export"] = write_results_to_google_sheets(
+            result=result,
+            spreadsheet_id=args.google_sheets_spreadsheet_id,
+            summary_worksheet_name=args.google_sheets_summary_worksheet,
+            keywords_worksheet_name=args.google_sheets_keywords_worksheet,
+        )
 
     output = json.dumps(result, indent=2)
     print(output)

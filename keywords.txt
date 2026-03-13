@@ -4,3 +4,4 @@ Voxtral
 Devstral
 OCR
 Mistral Cloud
+Sandbox
