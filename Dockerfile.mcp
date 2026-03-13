@@ -14,6 +14,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 # Copy source code
 COPY src/ ./src/
 COPY keywords.txt ./
+COPY README.md ./
 
 # Install the project itself
 RUN uv sync --frozen --no-dev
