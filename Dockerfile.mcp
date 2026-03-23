@@ -10,7 +10,7 @@ COPY pyproject.toml uv.lock ./
 
 # Install dependencies into the system Python (no venv needed in container)
 RUN uv sync --frozen --no-dev --no-install-project
-RUN uv run crawl4ai-setup
+RUN .venv/bin/crawl4ai-setup
 
 # Copy source code
 COPY src/ ./src/
