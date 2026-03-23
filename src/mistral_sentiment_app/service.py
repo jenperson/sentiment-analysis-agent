@@ -5,12 +5,15 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from html import unescape
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+from xml.etree import ElementTree as ET
 
 from bs4 import BeautifulSoup
 from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, JsonCssExtractionStrategy
+import requests
 
 from mistral_sentiment_app.google_sheets_export import (
     DEFAULT_GOOGLE_SHEETS_SPREADSHEET_ID,
@@ -231,6 +234,163 @@ def _safe_timestamp_seconds(raw_value: str | int | float | None) -> float:
     if value > 1_000_000_000_000:
         return value / 1000.0
     return value
+
+
+def _parse_atom_datetime(value: str | None) -> float:
+    if not value:
+        return 0.0
+
+    text = value.strip()
+    if not text:
+        return 0.0
+
+    normalized = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        pass
+
+    try:
+        dt = parsedate_to_datetime(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _atom_child_text(node: ET.Element, tag: str, namespace: dict[str, str]) -> str:
+    child = node.find(f"a:{tag}", namespace)
+    if child is None or child.text is None:
+        return ""
+    return child.text.strip()
+
+
+def _atom_entry_link(node: ET.Element, namespace: dict[str, str]) -> str:
+    for link_node in node.findall("a:link", namespace):
+        rel = (link_node.get("rel") or "alternate").strip().lower()
+        href = (link_node.get("href") or "").strip()
+        if rel == "alternate" and href:
+            return href
+    first = node.find("a:link", namespace)
+    if first is None:
+        return ""
+    return (first.get("href") or "").strip()
+
+
+def _fetch_reddit_atom_entries(feed_url: str, user_agent: str) -> list[ET.Element]:
+    response = requests.get(
+        feed_url,
+        headers={"User-Agent": user_agent},
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    root = ET.fromstring(response.text)
+    namespace = {"a": "http://www.w3.org/2005/Atom"}
+    return root.findall("a:entry", namespace)
+
+
+def _fetch_weekly_data_from_reddit_rss(
+    subreddit_name: str,
+    since_utc: float,
+    until_utc: float,
+    post_limit: int,
+    comment_limit: int,
+    user_agent: str,
+) -> tuple[list[PostRecord], list[CommentRecord]]:
+    namespace = {"a": "http://www.w3.org/2005/Atom"}
+    posts: list[PostRecord] = []
+    comments: list[CommentRecord] = []
+
+    posts_feed = f"{REDDIT_BASE_URL}/r/{subreddit_name}/new/.rss"
+    comments_feed = f"{REDDIT_BASE_URL}/r/{subreddit_name}/comments/.rss"
+
+    try:
+        post_entries = _fetch_reddit_atom_entries(posts_feed, user_agent)
+    except Exception:
+        post_entries = []
+
+    for entry in post_entries:
+        if len(posts) >= post_limit:
+            break
+        created_utc = _parse_atom_datetime(
+            _atom_child_text(entry, "updated", namespace)
+            or _atom_child_text(entry, "published", namespace)
+        )
+        if created_utc < since_utc or created_utc > until_utc:
+            continue
+
+        permalink = _atom_entry_link(entry, namespace)
+        entry_id = _atom_child_text(entry, "id", namespace)
+        post_id = _post_id(entry_id.rsplit("/", 1)[-1]) if entry_id else ""
+        title = _atom_child_text(entry, "title", namespace)
+        content_html = _atom_child_text(entry, "content", namespace) or _atom_child_text(
+            entry,
+            "summary",
+            namespace,
+        )
+
+        posts.append(
+            PostRecord(
+                id=post_id,
+                title=title,
+                body=_strip_html(content_html),
+                score=0,
+                created_utc=created_utc,
+                permalink=permalink,
+            )
+        )
+
+    try:
+        comment_entries = _fetch_reddit_atom_entries(comments_feed, user_agent)
+    except Exception:
+        comment_entries = []
+
+    for entry in comment_entries:
+        if len(comments) >= comment_limit:
+            break
+        created_utc = _parse_atom_datetime(
+            _atom_child_text(entry, "updated", namespace)
+            or _atom_child_text(entry, "published", namespace)
+        )
+        if created_utc < since_utc or created_utc > until_utc:
+            continue
+
+        permalink = _atom_entry_link(entry, namespace)
+        entry_id = _atom_child_text(entry, "id", namespace)
+        comment_id = ""
+        if entry_id:
+            comment_id = _comment_id(entry_id.rsplit("/", 1)[-1])
+        if not comment_id and permalink:
+            parsed = urlparse(permalink)
+            path_parts = [part for part in parsed.path.split("/") if part]
+            if path_parts:
+                comment_id = _comment_id(path_parts[-1])
+
+        body_html = _atom_child_text(entry, "content", namespace) or _atom_child_text(
+            entry,
+            "summary",
+            namespace,
+        )
+        body = _strip_html(body_html)
+        if not body:
+            continue
+
+        comments.append(
+            CommentRecord(
+                id=comment_id,
+                body=body,
+                score=0,
+                created_utc=created_utc,
+                permalink=permalink,
+            )
+        )
+
+    return posts, comments
 
 
 def _as_list_from_extracted_content(extracted_content: str | list | dict | None) -> list[dict]:
@@ -527,8 +687,11 @@ def _sync_fetch_weekly_data_with_crawl4ai(
     return asyncio.run(runner())
 
 
-def top_posts_by_upvotes(posts: list[PostRecord], n: int = 3) -> list[dict]:
-    sorted_posts = sorted(posts, key=lambda item: item.score, reverse=True)[:n]
+def top_posts(posts: list[PostRecord], n: int = 3, *, method: str = "upvotes") -> list[dict]:
+    if method == "rss_recency_fallback":
+        sorted_posts = sorted(posts, key=lambda item: item.created_utc, reverse=True)[:n]
+    else:
+        sorted_posts = sorted(posts, key=lambda item: item.score, reverse=True)[:n]
     out: list[dict] = []
     for post in sorted_posts:
         content = post.title.strip()
@@ -584,6 +747,7 @@ def build_result(
     mentions: dict[str, dict],
     analysis_provider: str,
     analysis_model: str,
+    top_posts_method: str,
 ) -> dict:
     duration_days = (window_end - window_start).total_seconds() / 86400
     return {
@@ -605,7 +769,8 @@ def build_result(
         "average_sentiment": sentiment["average_sentiment"],
         "summary_of_week": sentiment["summary"],
         "sentiment_method_notes": sentiment.get("method_notes", ""),
-        "top_3_posts_by_upvotes": top_posts_by_upvotes(posts, n=3),
+        "top_posts_method": top_posts_method,
+        "top_3_posts_by_upvotes": top_posts(posts, n=3, method=top_posts_method),
         "keyword_mentions": mentions,
     }
 
@@ -625,8 +790,27 @@ def run_analysis(options: AnalysisOptions) -> dict:
         crawl_concurrency=options.reddit_crawl_concurrency,
         user_agent=options.reddit_user_agent,
     )
+    rss_fallback_used = False
+
+    if reddit_block_detected and not posts and not comments:
+        rss_posts, rss_comments = _fetch_weekly_data_from_reddit_rss(
+            subreddit_name=options.subreddit,
+            since_utc=since_utc,
+            until_utc=until_utc,
+            post_limit=options.reddit_post_limit,
+            comment_limit=options.reddit_comment_limit,
+            user_agent=options.reddit_user_agent,
+        )
+        if rss_posts or rss_comments:
+            posts = rss_posts
+            comments = rss_comments
+            rss_fallback_used = True
 
     mentions = keyword_mentions(keywords=keywords, posts=posts, comments=comments)
+
+    top_posts_method = "upvotes"
+    if rss_fallback_used:
+        top_posts_method = "rss_recency_fallback"
 
     if not posts and not comments:
         empty_summary = "No posts or comments were found in the selected window."
@@ -654,6 +838,7 @@ def run_analysis(options: AnalysisOptions) -> dict:
             mentions=mentions,
             analysis_provider=options.provider,
             analysis_model=options.model_override or "",
+            top_posts_method=top_posts_method,
         )
 
         if options.write_google_sheets:
@@ -666,6 +851,7 @@ def run_analysis(options: AnalysisOptions) -> dict:
 
         result["crawl_runtime_notes"] = {
             "reddit_block_detected": reddit_block_detected,
+            "reddit_rss_fallback_used": rss_fallback_used,
         }
 
         return result
@@ -690,6 +876,7 @@ def run_analysis(options: AnalysisOptions) -> dict:
         mentions=mentions,
         analysis_provider=analysis_provider,
         analysis_model=analysis_model,
+        top_posts_method=top_posts_method,
     )
 
     if options.write_google_sheets:
@@ -702,6 +889,7 @@ def run_analysis(options: AnalysisOptions) -> dict:
 
     result["crawl_runtime_notes"] = {
         "reddit_block_detected": reddit_block_detected,
+        "reddit_rss_fallback_used": rss_fallback_used,
     }
 
     return result
