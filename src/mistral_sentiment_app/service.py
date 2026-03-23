@@ -24,7 +24,10 @@ from mistral_sentiment_app.models import CommentRecord, PostRecord
 REDDIT_BASE_URL = "https://www.reddit.com"
 OLD_REDDIT_BASE_URL = "https://old.reddit.com"
 DEFAULT_SUBREDDIT = "MistralAI"
-DEFAULT_PUBLIC_REDDIT_USER_AGENT = "mistral-weekly-sentiment/0.1"
+DEFAULT_PUBLIC_REDDIT_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
 
 
 @dataclass
@@ -154,6 +157,21 @@ def _strip_html(value: str) -> str:
     return text.strip()
 
 
+def _is_reddit_block_page(html: str) -> bool:
+    if not html:
+        return False
+    lowered = html.lower()
+    block_indicators = [
+        "whoa there, pardner",
+        "blocked",
+        "access denied",
+        "captcha",
+        "cloudflare",
+        "request has been blocked",
+    ]
+    return any(marker in lowered for marker in block_indicators)
+
+
 def _safe_int(value: str | int | float | None, default: int = 0) -> int:
     if value is None:
         return default
@@ -274,7 +292,36 @@ async def _fetch_post_listing(
             {"name": "permalink", "type": "attribute", "attribute": "data-permalink"},
         ],
     }
-    return await _crawl_extract(crawler, url=url, schema=schema)
+    extracted = await _crawl_extract(crawler, url=url, schema=schema)
+    if extracted:
+        return extracted
+
+    # Fallback: parse raw listing HTML when JSON/CSS extraction is empty.
+    result = await crawler.arun(url=url, config=CrawlerRunConfig())
+    if not result.success:
+        return []
+
+    html = str(getattr(result, "html", "") or getattr(result, "cleaned_html", "") or "")
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    items: list[dict] = []
+    for post in soup.select("div.thing.link"):
+        title_node = post.select_one("a.title")
+        if title_node is None:
+            continue
+        items.append(
+            {
+                "fullname": post.get("data-fullname", ""),
+                "id": post.get("data-fullname", ""),
+                "title": title_node.get_text(strip=True),
+                "score": post.get("data-score", ""),
+                "timestamp": post.get("data-timestamp", ""),
+                "permalink": post.get("data-permalink", ""),
+            }
+        )
+    return items
 
 
 async def _fetch_post_page_details(
@@ -340,8 +387,8 @@ def _sync_fetch_weekly_data_with_crawl4ai(
     comment_limit: int,
     crawl_concurrency: int,
     user_agent: str,
-) -> tuple[list[PostRecord], list[CommentRecord]]:
-    async def runner() -> tuple[list[PostRecord], list[CommentRecord]]:
+) -> tuple[list[PostRecord], list[CommentRecord], bool]:
+    async def runner() -> tuple[list[PostRecord], list[CommentRecord], bool]:
         browser_config = BrowserConfig(headless=True, user_agent=user_agent)
         semaphore = asyncio.Semaphore(max(1, crawl_concurrency))
 
@@ -351,6 +398,7 @@ def _sync_fetch_weekly_data_with_crawl4ai(
         after_fullname: str | None = None
         count = 0
         listing_page_cap = 30
+        reddit_block_detected = False
 
         async with AsyncWebCrawler(config=browser_config) as crawler:
             for _ in range(listing_page_cap):
@@ -360,6 +408,19 @@ def _sync_fetch_weekly_data_with_crawl4ai(
                     after_fullname=after_fullname,
                     count=count,
                 )
+
+                if not listing_items:
+                    listing_probe = await crawler.arun(
+                        url=f"{OLD_REDDIT_BASE_URL}/r/{subreddit_name}/new/?limit=100",
+                        config=CrawlerRunConfig(),
+                    )
+                    listing_html = str(
+                        getattr(listing_probe, "html", "")
+                        or getattr(listing_probe, "cleaned_html", "")
+                        or ""
+                    )
+                    if _is_reddit_block_page(listing_html):
+                        reddit_block_detected = True
                 if not listing_items:
                     break
 
@@ -461,7 +522,7 @@ def _sync_fetch_weekly_data_with_crawl4ai(
                 after_fullname = last_fullname
                 count += len(listing_items)
 
-        return posts[:post_limit], comments[:comment_limit]
+        return posts[:post_limit], comments[:comment_limit], reddit_block_detected
 
     return asyncio.run(runner())
 
@@ -555,7 +616,7 @@ def run_analysis(options: AnalysisOptions) -> dict:
     since_utc = window_start.timestamp()
     until_utc = window_end.timestamp()
 
-    posts, comments = _sync_fetch_weekly_data_with_crawl4ai(
+    posts, comments, reddit_block_detected = _sync_fetch_weekly_data_with_crawl4ai(
         subreddit_name=options.subreddit,
         since_utc=since_utc,
         until_utc=until_utc,
@@ -566,6 +627,49 @@ def run_analysis(options: AnalysisOptions) -> dict:
     )
 
     mentions = keyword_mentions(keywords=keywords, posts=posts, comments=comments)
+
+    if not posts and not comments:
+        empty_summary = "No posts or comments were found in the selected window."
+        empty_notes = "LLM analysis skipped because the crawl returned an empty dataset."
+        if reddit_block_detected:
+            empty_summary = (
+                "No posts or comments were found because Reddit likely blocked or challenged the crawler from this runtime environment."
+            )
+            empty_notes = (
+                "LLM analysis skipped. Reddit block/challenge indicators were detected in the listing response."
+            )
+        sentiment = {
+            "average_sentiment": None,
+            "summary": empty_summary,
+            "method_notes": empty_notes,
+        }
+        result = build_result(
+            subreddit_name=options.subreddit,
+            window_start=window_start,
+            window_end=window_end,
+            window_label=window_label,
+            posts=posts,
+            comments=comments,
+            sentiment=sentiment,
+            mentions=mentions,
+            analysis_provider=options.provider,
+            analysis_model=options.model_override or "",
+        )
+
+        if options.write_google_sheets:
+            result["google_sheets_export"] = write_results_to_google_sheets(
+                result=result,
+                spreadsheet_id=options.google_sheets_spreadsheet_id,
+                summary_worksheet_name=options.google_sheets_summary_worksheet,
+                keywords_worksheet_name=options.google_sheets_keywords_worksheet,
+            )
+
+        result["crawl_runtime_notes"] = {
+            "reddit_block_detected": reddit_block_detected,
+        }
+
+        return result
+
     sentiment, analysis_provider, analysis_model = analyze_sentiment(
         posts=posts,
         comments=comments,
@@ -595,5 +699,9 @@ def run_analysis(options: AnalysisOptions) -> dict:
             summary_worksheet_name=options.google_sheets_summary_worksheet,
             keywords_worksheet_name=options.google_sheets_keywords_worksheet,
         )
+
+    result["crawl_runtime_notes"] = {
+        "reddit_block_detected": reddit_block_detected,
+    }
 
     return result
