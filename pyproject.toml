@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "anthropic>=0.52.0",
+  "crawl4ai>=0.8.0",
   "fastapi>=0.116.0",
   "fastmcp>=2.13.0",
   "gspread>=6.1.2",

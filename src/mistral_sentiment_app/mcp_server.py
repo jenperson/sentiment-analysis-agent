@@ -59,6 +59,7 @@ def analyze_mistral_subreddit(
         model_override=model,
         reddit_post_limit=int(os.getenv("REDDIT_POST_LIMIT", "300")),
         reddit_comment_limit=int(os.getenv("REDDIT_COMMENT_LIMIT", "1500")),
+        reddit_crawl_concurrency=int(os.getenv("REDDIT_CRAWL_CONCURRENCY", "4")),
         reddit_user_agent=os.getenv("REDDIT_USER_AGENT", "").strip() or DEFAULT_PUBLIC_REDDIT_USER_AGENT,
         write_google_sheets=write_google_sheets,
         google_sheets_spreadsheet_id=google_sheets_spreadsheet_id,

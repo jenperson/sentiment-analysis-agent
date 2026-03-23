@@ -1,11 +1,16 @@
+import asyncio
+import json
 import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from html import unescape
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
-import requests
+from bs4 import BeautifulSoup
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, JsonCssExtractionStrategy
 
 from mistral_sentiment_app.google_sheets_export import (
     DEFAULT_GOOGLE_SHEETS_SPREADSHEET_ID,
@@ -17,6 +22,7 @@ from mistral_sentiment_app.llm_analysis import DEFAULT_ANALYSIS_TOPIC, DEFAULT_L
 from mistral_sentiment_app.models import CommentRecord, PostRecord
 
 REDDIT_BASE_URL = "https://www.reddit.com"
+OLD_REDDIT_BASE_URL = "https://old.reddit.com"
 DEFAULT_SUBREDDIT = "MistralAI"
 DEFAULT_PUBLIC_REDDIT_USER_AGENT = "mistral-weekly-sentiment/0.1"
 
@@ -36,6 +42,7 @@ class AnalysisOptions:
     model_override: str = ""
     reddit_post_limit: int = 300
     reddit_comment_limit: int = 1500
+    reddit_crawl_concurrency: int = 4
     reddit_user_agent: str = DEFAULT_PUBLIC_REDDIT_USER_AGENT
     write_google_sheets: bool = False
     google_sheets_spreadsheet_id: str = DEFAULT_GOOGLE_SHEETS_SPREADSHEET_ID
@@ -130,134 +137,333 @@ def load_keywords(path: Path) -> list[str]:
 
 
 def full_reddit_url(permalink: str) -> str:
+    if not permalink:
+        return ""
+    if permalink.startswith("http://") or permalink.startswith("https://"):
+        return permalink
     return f"{REDDIT_BASE_URL}{permalink}"
 
 
-def _public_reddit_get(path: str, params: dict, user_agent: str) -> dict:
-    url = f"https://www.reddit.com{path}"
-    response = requests.get(
-        url,
-        params={**params, "raw_json": 1},
-        headers={"User-Agent": user_agent},
-        timeout=30,
-    )
-    response.raise_for_status()
-    return response.json()
+def _strip_html(value: str) -> str:
+    text = re.sub(r"<br\\s*/?>", "\n", value, flags=re.IGNORECASE)
+    text = re.sub(r"</p>", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = unescape(text)
+    text = text.replace("\r", "")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
-def fetch_weekly_posts_public(
+def _safe_int(value: str | int | float | None, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    text = str(value).strip().lower()
+    if not text:
+        return default
+
+    multiplier = 1
+    if text.endswith("k"):
+        text = text[:-1]
+        multiplier = 1_000
+    elif text.endswith("m"):
+        text = text[:-1]
+        multiplier = 1_000_000
+
+    text = text.replace(",", "")
+    try:
+        return int(float(text) * multiplier)
+    except ValueError:
+        pass
+
+    match = re.search(r"-?\\d+", text)
+    if match:
+        return int(match.group(0))
+    return default
+
+
+def _safe_timestamp_seconds(raw_value: str | int | float | None) -> float:
+    if raw_value is None:
+        return 0.0
+
+    if isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not text:
+            return 0.0
+        try:
+            value = float(text)
+        except ValueError:
+            # old.reddit exposes comment timestamps as ISO-8601 datetimes
+            normalized = text.replace("Z", "+00:00")
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                return 0.0
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+    else:
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    if value > 1_000_000_000_000:
+        return value / 1000.0
+    return value
+
+
+def _as_list_from_extracted_content(extracted_content: str | list | dict | None) -> list[dict]:
+    if extracted_content is None:
+        return []
+
+    data = extracted_content
+    if isinstance(data, str):
+        payload = data.strip()
+        if not payload:
+            return []
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return []
+
+    if isinstance(data, dict):
+        return [data]
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    return []
+
+
+async def _crawl_extract(
+    crawler: AsyncWebCrawler,
+    *,
+    url: str,
+    schema: dict,
+) -> list[dict]:
+    run_config = CrawlerRunConfig(extraction_strategy=JsonCssExtractionStrategy(schema))
+    result = await crawler.arun(url=url, config=run_config)
+    if not result.success:
+        return []
+    return _as_list_from_extracted_content(getattr(result, "extracted_content", None))
+
+
+async def _fetch_post_listing(
+    crawler: AsyncWebCrawler,
+    subreddit_name: str,
+    *,
+    after_fullname: str | None,
+    count: int,
+) -> list[dict]:
+    query_parts = ["limit=100"]
+    if after_fullname:
+        query_parts.append(f"after={after_fullname}")
+        query_parts.append(f"count={count}")
+    url = f"{OLD_REDDIT_BASE_URL}/r/{subreddit_name}/new/?{'&'.join(query_parts)}"
+
+    schema = {
+        "name": "subreddit_posts",
+        "baseSelector": "div.thing.link",
+        "fields": [
+            {"name": "fullname", "type": "attribute", "attribute": "data-fullname"},
+            {"name": "id", "type": "attribute", "attribute": "data-fullname"},
+            {"name": "title", "selector": "a.title", "type": "text"},
+            {"name": "score", "type": "attribute", "attribute": "data-score"},
+            {"name": "timestamp", "type": "attribute", "attribute": "data-timestamp"},
+            {"name": "permalink", "type": "attribute", "attribute": "data-permalink"},
+        ],
+    }
+    return await _crawl_extract(crawler, url=url, schema=schema)
+
+
+async def _fetch_post_page_details(
+    crawler: AsyncWebCrawler,
+    post_url: str,
+) -> tuple[str, list[dict]]:
+    result = await crawler.arun(url=post_url, config=CrawlerRunConfig())
+    if not result.success:
+        return "", []
+
+    html = str(getattr(result, "html", "") or getattr(result, "cleaned_html", "") or "")
+    if not html:
+        return "", []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    body_html = ""
+    post_node = soup.select_one("div.thing.link")
+    if post_node is not None:
+        body_node = post_node.select_one("div.usertext-body div.md")
+        if body_node is not None:
+            body_html = str(body_node)
+
+    comment_rows: list[dict] = []
+    for comment_node in soup.select("div.thing.comment"):
+        body_node = comment_node.select_one("div.usertext-body div.md")
+        permalink_node = comment_node.select_one("a.bylink[data-event-action='permalink']")
+        timestamp_node = comment_node.select_one("time.live-timestamp")
+        score_node = comment_node.select_one("span.score")
+        comment_id = comment_node.get("data-fullname", "") or comment_node.get("id", "")
+        if comment_id.startswith("thing_"):
+            comment_id = comment_id.removeprefix("thing_")
+        comment_rows.append(
+            {
+                "id": comment_id,
+                "score": comment_node.get("data-score", "") or (score_node.get_text(strip=True) if score_node else ""),
+                "timestamp": comment_node.get("data-timestamp", "") or (timestamp_node.get("datetime", "") if timestamp_node else ""),
+                "permalink": permalink_node.get("href", "") if permalink_node else "",
+                "body": str(body_node) if body_node is not None else "",
+            }
+        )
+
+    return _strip_html(body_html), comment_rows
+
+
+def _comment_id(value: str) -> str:
+    if not value:
+        return ""
+    return value.removeprefix("t1_").strip()
+
+
+def _post_id(value: str) -> str:
+    if not value:
+        return ""
+    return value.removeprefix("t3_").strip()
+
+
+def _sync_fetch_weekly_data_with_crawl4ai(
     subreddit_name: str,
     since_utc: float,
     until_utc: float,
     post_limit: int,
-    user_agent: str,
-) -> list[PostRecord]:
-    records: list[PostRecord] = []
-    after: str | None = None
-    page_limit = 100
-
-    while len(records) < post_limit:
-        remaining = post_limit - len(records)
-        listing = _public_reddit_get(
-            path=f"/r/{subreddit_name}/new.json",
-            params={"limit": min(page_limit, remaining), "after": after},
-            user_agent=user_agent,
-        )
-        data = listing.get("data", {})
-        children = data.get("children", [])
-        if not children:
-            break
-
-        oldest_created = float("inf")
-        for child in children:
-            item = child.get("data", {})
-            created_utc = float(item.get("created_utc", 0.0))
-            oldest_created = min(oldest_created, created_utc)
-
-            if created_utc < since_utc or created_utc > until_utc:
-                continue
-
-            records.append(
-                PostRecord(
-                    id=item.get("id", ""),
-                    title=item.get("title", "") or "",
-                    body=item.get("selftext", "") or "",
-                    score=int(item.get("score", 0) or 0),
-                    created_utc=created_utc,
-                    permalink=full_reddit_url(item.get("permalink", "")),
-                )
-            )
-
-        if len(records) >= post_limit:
-            break
-
-        after = data.get("after")
-        if not after:
-            break
-
-        if oldest_created < since_utc:
-            break
-
-    return records
-
-
-def fetch_weekly_comments_public(
-    subreddit_name: str,
-    since_utc: float,
-    until_utc: float,
     comment_limit: int,
+    crawl_concurrency: int,
     user_agent: str,
-) -> list[CommentRecord]:
-    records: list[CommentRecord] = []
-    after: str | None = None
-    page_limit = 100
+) -> tuple[list[PostRecord], list[CommentRecord]]:
+    async def runner() -> tuple[list[PostRecord], list[CommentRecord]]:
+        browser_config = BrowserConfig(headless=True, user_agent=user_agent)
+        semaphore = asyncio.Semaphore(max(1, crawl_concurrency))
 
-    while len(records) < comment_limit:
-        remaining = comment_limit - len(records)
-        listing = _public_reddit_get(
-            path=f"/r/{subreddit_name}/comments.json",
-            params={"limit": min(page_limit, remaining), "after": after},
-            user_agent=user_agent,
-        )
-        data = listing.get("data", {})
-        children = data.get("children", [])
-        if not children:
-            break
+        posts: list[PostRecord] = []
+        comments: list[CommentRecord] = []
+        seen_comment_ids: set[str] = set()
+        after_fullname: str | None = None
+        count = 0
+        listing_page_cap = 30
 
-        oldest_created = float("inf")
-        for child in children:
-            item = child.get("data", {})
-            created_utc = float(item.get("created_utc", 0.0))
-            oldest_created = min(oldest_created, created_utc)
-
-            if created_utc < since_utc or created_utc > until_utc:
-                continue
-
-            body = (item.get("body", "") or "").strip()
-            if not body or body in {"[deleted]", "[removed]"}:
-                continue
-
-            records.append(
-                CommentRecord(
-                    id=item.get("id", ""),
-                    body=body,
-                    score=int(item.get("score", 0) or 0),
-                    created_utc=created_utc,
-                    permalink=full_reddit_url(item.get("permalink", "")),
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            for _ in range(listing_page_cap):
+                listing_items = await _fetch_post_listing(
+                    crawler,
+                    subreddit_name=subreddit_name,
+                    after_fullname=after_fullname,
+                    count=count,
                 )
-            )
+                if not listing_items:
+                    break
 
-        if len(records) >= comment_limit:
-            break
+                oldest_seen = float("inf")
+                candidates: list[tuple[dict, float, str, str]] = []
+                for item in listing_items:
+                    created_utc = _safe_timestamp_seconds(item.get("timestamp"))
+                    if created_utc > 0:
+                        oldest_seen = min(oldest_seen, created_utc)
 
-        after = data.get("after")
-        if not after:
-            break
+                    if created_utc < since_utc or created_utc > until_utc:
+                        continue
 
-        if oldest_created < since_utc:
-            break
+                    permalink = full_reddit_url(str(item.get("permalink", "") or ""))
+                    post_url = permalink or ""
+                    if not post_url:
+                        continue
+                    crawl_post_url = post_url.replace(REDDIT_BASE_URL, OLD_REDDIT_BASE_URL, 1)
+                    candidates.append((item, created_utc, permalink, crawl_post_url))
 
-    return records
+                async def fetch_with_limit(url: str) -> tuple[str, list[dict]]:
+                    async with semaphore:
+                        return await _fetch_post_page_details(crawler, url)
+
+                details_list = await asyncio.gather(
+                    *(fetch_with_limit(crawl_url) for _, _, _, crawl_url in candidates)
+                )
+
+                for (item, created_utc, permalink, _), (body_text, comment_rows) in zip(
+                    candidates,
+                    details_list,
+                    strict=True,
+                ):
+                    if len(posts) < post_limit:
+                        post_record = PostRecord(
+                            id=_post_id(str(item.get("id", "") or "")),
+                            title=str(item.get("title", "") or "").strip(),
+                            body=body_text,
+                            score=_safe_int(item.get("score")),
+                            created_utc=created_utc,
+                            permalink=permalink,
+                        )
+                        posts.append(post_record)
+
+                    if len(posts) >= post_limit and len(comments) >= comment_limit:
+                        break
+
+                    if len(comments) < comment_limit:
+                        for row in comment_rows:
+                            comment_created_utc = _safe_timestamp_seconds(row.get("timestamp"))
+                            if comment_created_utc < since_utc or comment_created_utc > until_utc:
+                                continue
+
+                            body = _strip_html(str(row.get("body", "") or ""))
+                            if not body or body in {"[deleted]", "[removed]"}:
+                                continue
+
+                            raw_comment_id = _comment_id(str(row.get("id", "") or ""))
+                            parsed = urlparse(str(row.get("permalink", "") or ""))
+                            if not raw_comment_id and parsed.fragment:
+                                raw_comment_id = parsed.fragment
+                            if not raw_comment_id:
+                                continue
+                            if raw_comment_id in seen_comment_ids:
+                                continue
+                            seen_comment_ids.add(raw_comment_id)
+
+                            comment_permalink = str(row.get("permalink", "") or "")
+                            if comment_permalink and not comment_permalink.startswith("http"):
+                                comment_permalink = urljoin(REDDIT_BASE_URL, comment_permalink)
+                            if comment_permalink.startswith(OLD_REDDIT_BASE_URL):
+                                comment_permalink = comment_permalink.replace(
+                                    OLD_REDDIT_BASE_URL,
+                                    REDDIT_BASE_URL,
+                                    1,
+                                )
+
+                            comments.append(
+                                CommentRecord(
+                                    id=raw_comment_id,
+                                    body=body,
+                                    score=_safe_int(row.get("score")),
+                                    created_utc=comment_created_utc,
+                                    permalink=comment_permalink,
+                                )
+                            )
+                            if len(comments) >= comment_limit:
+                                break
+
+                if len(posts) >= post_limit and len(comments) >= comment_limit:
+                    break
+
+                if oldest_seen < since_utc:
+                    break
+
+                last_fullname = str(listing_items[-1].get("fullname", "") or "").strip()
+                if not last_fullname:
+                    break
+                after_fullname = last_fullname
+                count += len(listing_items)
+
+        return posts[:post_limit], comments[:comment_limit]
+
+    return asyncio.run(runner())
 
 
 def top_posts_by_upvotes(posts: list[PostRecord], n: int = 3) -> list[dict]:
@@ -349,18 +555,13 @@ def run_analysis(options: AnalysisOptions) -> dict:
     since_utc = window_start.timestamp()
     until_utc = window_end.timestamp()
 
-    posts = fetch_weekly_posts_public(
+    posts, comments = _sync_fetch_weekly_data_with_crawl4ai(
         subreddit_name=options.subreddit,
         since_utc=since_utc,
         until_utc=until_utc,
         post_limit=options.reddit_post_limit,
-        user_agent=options.reddit_user_agent,
-    )
-    comments = fetch_weekly_comments_public(
-        subreddit_name=options.subreddit,
-        since_utc=since_utc,
-        until_utc=until_utc,
         comment_limit=options.reddit_comment_limit,
+        crawl_concurrency=options.reddit_crawl_concurrency,
         user_agent=options.reddit_user_agent,
     )
 
