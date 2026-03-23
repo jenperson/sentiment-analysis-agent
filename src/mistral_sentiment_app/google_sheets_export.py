@@ -1,5 +1,6 @@
 import json
 import os
+from base64 import b64decode
 from datetime import datetime, timezone
 
 import gspread
@@ -14,6 +15,46 @@ GOOGLE_SHEETS_SCOPES = [
 ]
 
 
+def _parse_service_account_json(raw: str) -> dict:
+    candidates = [raw.strip()]
+    stripped = raw.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {'"', "'"}:
+        candidates.append(stripped[1:-1])
+
+    parse_errors: list[str] = []
+
+    for candidate in candidates:
+        for payload in (candidate,):
+            try:
+                parsed = json.loads(payload)
+                if isinstance(parsed, str):
+                    parsed = json.loads(parsed)
+                if isinstance(parsed, dict):
+                    private_key = parsed.get("private_key")
+                    if isinstance(private_key, str):
+                        parsed["private_key"] = private_key.replace("\\n", "\n")
+                    return parsed
+            except Exception as exc:  # noqa: BLE001
+                parse_errors.append(str(exc))
+
+        try:
+            decoded = b64decode(candidate, validate=True).decode("utf-8")
+            parsed = json.loads(decoded)
+            if isinstance(parsed, dict):
+                private_key = parsed.get("private_key")
+                if isinstance(private_key, str):
+                    parsed["private_key"] = private_key.replace("\\n", "\n")
+                return parsed
+        except Exception as exc:  # noqa: BLE001
+            parse_errors.append(str(exc))
+
+    raise RuntimeError(
+        "GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON is not valid JSON (or base64-encoded JSON). "
+        "Ensure the env var contains the full service account document. "
+        f"Parse attempts failed: {parse_errors[:2]}"
+    )
+
+
 def _get_required_credentials() -> Credentials:
     credentials_file = os.getenv("GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE", "").strip()
     credentials_json = os.getenv("GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON", "").strip()
@@ -23,7 +64,7 @@ def _get_required_credentials() -> Credentials:
 
     if credentials_json:
         return Credentials.from_service_account_info(
-            json.loads(credentials_json),
+            _parse_service_account_json(credentials_json),
             scopes=GOOGLE_SHEETS_SCOPES,
         )
 
@@ -66,7 +107,16 @@ def write_results_to_google_sheets(
     keywords_worksheet_name: str,
 ) -> dict:
     client = _get_client()
-    spreadsheet = client.open_by_key(spreadsheet_id)
+    try:
+        spreadsheet = client.open_by_key(spreadsheet_id)
+    except PermissionError as exc:
+        service_account_email = getattr(client.auth, "service_account_email", "unknown")
+        raise RuntimeError(
+            "Google Sheets access denied while opening spreadsheet. "
+            f"spreadsheet_id={spreadsheet_id}, service_account_email={service_account_email}. "
+            "Verify the sheet is shared with this service account as Editor and that "
+            "Google Sheets API/Drive API are enabled in the service account project."
+        ) from exc
 
     summary_headers = [
         "run_utc",

@@ -48,6 +48,13 @@ Optional Google Sheets export:
 - `GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE=/absolute/path/to/service-account.json`
 
 Or use `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON` instead of a file path.
+For hosted env vars (for example, Koyeb), use compact one-line JSON to avoid formatting issues:
+
+```bash
+cat service-account.json | jq -c .
+```
+
+Then paste that output as `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON`.
 
 The spreadsheet must be shared with the Google service account email used by those credentials.
 
