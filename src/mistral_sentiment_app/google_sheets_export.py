@@ -106,11 +106,12 @@ def write_results_to_google_sheets(
     summary_worksheet_name: str,
     keywords_worksheet_name: str,
 ) -> dict:
-    client = _get_client()
+    credentials = _get_required_credentials()
+    client = gspread.authorize(credentials)
     try:
         spreadsheet = client.open_by_key(spreadsheet_id)
     except PermissionError as exc:
-        service_account_email = getattr(client.auth, "service_account_email", "unknown")
+        service_account_email = getattr(credentials, "service_account_email", "unknown")
         raise RuntimeError(
             "Google Sheets access denied while opening spreadsheet. "
             f"spreadsheet_id={spreadsheet_id}, service_account_email={service_account_email}. "
