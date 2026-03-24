@@ -5,6 +5,7 @@ from fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
+from mistral_sentiment_app.discord_service import run_discord_analysis
 from mistral_sentiment_app.google_sheets_export import (
     DEFAULT_GOOGLE_SHEETS_SPREADSHEET_ID,
     DEFAULT_KEYWORDS_WORKSHEET,
@@ -16,6 +17,11 @@ from mistral_sentiment_app.service import (
     DEFAULT_PUBLIC_REDDIT_USER_AGENT,
     DEFAULT_SUBREDDIT,
     run_analysis,
+)
+from mistral_sentiment_app.twitter_service import (
+    DEFAULT_TWITTER_QUERY,
+    TwitterAnalysisOptions,
+    run_twitter_analysis,
 )
 
 mcp = FastMCP(
@@ -67,6 +73,87 @@ def analyze_mistral_subreddit(
         google_sheets_keywords_worksheet=google_sheets_keywords_worksheet,
     )
     return run_analysis(options)
+
+
+@mcp.tool
+def analyze_discord_server(
+    guild_id: int,
+    channel_ids: list[int] | None = None,
+    days: int = 7,
+    start_days_ago: int | None = None,
+    end_days_ago: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    keywords_file: str = "keywords.txt",
+    topic: str = DEFAULT_ANALYSIS_TOPIC,
+    provider: str = DEFAULT_LLM_PROVIDER,
+    model: str = "",
+    write_google_sheets: bool = False,
+    google_sheets_spreadsheet_id: str = DEFAULT_GOOGLE_SHEETS_SPREADSHEET_ID,
+    google_sheets_summary_worksheet: str = "discord_sentiment_summary",
+    google_sheets_keywords_worksheet: str = "discord_keyword_mentions",
+) -> dict:
+    """Analyze sentiment in a Discord server's messages over a time period."""
+    return run_discord_analysis(
+        guild_id=guild_id,
+        channel_ids=channel_ids,
+        days=days,
+        start_days_ago=start_days_ago,
+        end_days_ago=end_days_ago,
+        start_date=start_date,
+        end_date=end_date,
+        topic=topic,
+        provider=provider,
+        model_override=model,
+        keywords_file=keywords_file,
+        write_google_sheets=write_google_sheets,
+        google_sheets_spreadsheet_id=google_sheets_spreadsheet_id,
+        google_sheets_summary_worksheet=google_sheets_summary_worksheet,
+        google_sheets_keywords_worksheet=google_sheets_keywords_worksheet,
+    )
+
+
+@mcp.tool
+def analyze_twitter_query(
+    query: str = DEFAULT_TWITTER_QUERY,
+    days: int = 7,
+    start_days_ago: int | None = None,
+    end_days_ago: int | None = None,
+    date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    keywords_file: str = "keywords.txt",
+    topic: str = DEFAULT_ANALYSIS_TOPIC,
+    provider: str = DEFAULT_LLM_PROVIDER,
+    model: str = "",
+    write_google_sheets: bool = False,
+    google_sheets_spreadsheet_id: str = DEFAULT_GOOGLE_SHEETS_SPREADSHEET_ID,
+    google_sheets_summary_worksheet: str = "twitter_sentiment_summary",
+    google_sheets_keywords_worksheet: str = "twitter_keyword_mentions",
+) -> dict:
+    """Analyze sentiment in tweets matching a query over a time period."""
+    return run_twitter_analysis(
+        TwitterAnalysisOptions(
+            query=query,
+            days=days,
+            start_days_ago=start_days_ago,
+            end_days_ago=end_days_ago,
+            date=date,
+            start_date=start_date,
+            end_date=end_date,
+            keywords_file=keywords_file,
+            topic=topic,
+            provider=provider,
+            model_override=model,
+            write_google_sheets=write_google_sheets,
+            google_sheets_spreadsheet_id=google_sheets_spreadsheet_id,
+            google_sheets_summary_worksheet=google_sheets_summary_worksheet,
+            google_sheets_keywords_worksheet=google_sheets_keywords_worksheet,
+            twitter_post_limit=int(os.getenv("TWITTER_POST_LIMIT", "100")),
+            twitter_reply_limit=int(os.getenv("TWITTER_REPLY_LIMIT", "300")),
+            twitter_max_conversations=int(os.getenv("TWITTER_MAX_CONVERSATIONS", "20")),
+        )
+    )
 
 
 class _BearerTokenMiddleware(BaseHTTPMiddleware):

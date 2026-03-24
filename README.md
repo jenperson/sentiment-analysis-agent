@@ -33,6 +33,7 @@ cp .env.example .env
 - `REDDIT_USER_AGENT` (recommended, used by the crawler browser)
 - `REDDIT_CRAWL_CONCURRENCY` (optional, default `4`)
 - `MISTRAL_API_KEY`
+- `TWITTER_BEARER_TOKEN` (required for official Twitter/X API analysis)
 
 Optional provider overrides:
 
@@ -94,6 +95,8 @@ Default API endpoint:
 
 - `GET /health`
 - `POST /analyze`
+- `POST /analyze-discord`
+- `POST /analyze-twitter`
 
 Run the MCP server over stdio:
 
@@ -292,6 +295,124 @@ Example prompts for an AI assistant:
 - _"What was the sentiment in r/MistralAI from 2026-03-01 to 2026-03-07?"_
 - _"Analyze r/LocalLLaMA sentiment about open-source LLMs for the past week."_
 - _"Run sentiment analysis on r/MistralAI for the past two weeks and write to Google Sheets."_
+
+### Tool: `analyze_twitter_query`
+
+The MCP server also exposes a Twitter/X sentiment tool using the official API v2.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `query` | string | `MistralAI OR "Mistral AI"` | Twitter search query |
+| `days` | integer | `7` | Trailing window in days |
+| `start_days_ago` | integer | — | Older boundary (relative) |
+| `end_days_ago` | integer | — | Newer boundary (relative) |
+| `date` | string | — | Single UTC date `YYYY-MM-DD` |
+| `start_date` | string | — | Start of UTC date range |
+| `end_date` | string | — | End of UTC date range |
+| `topic` | string | `Mistral AI and its products` | Topic to score sentiment about |
+| `provider` | string | `mistral` | `mistral` or `claude` |
+| `model` | string | — | Override the default model |
+| `write_google_sheets` | boolean | `false` | Append to `twitter_sentiment_summary` and `twitter_keyword_mentions` |
+
+Twitter/X notes:
+
+- This integration uses the official API only (no scraping).
+- A paid developer tier is usually required for meaningful read access.
+
+FastAPI example for Twitter analysis:
+
+```bash
+curl -X POST https://your-service.koyeb.app/analyze-twitter \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "MistralAI OR \"Mistral AI\"", "days": 7, "write_google_sheets": true}'
+```
+
+### Tool: `analyze_discord_server`
+
+The MCP server also exposes a Discord sentiment analysis tool:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `guild_id` | integer | — | Discord server ID (required) |
+| `channel_ids` | array | — | Specific channel IDs to analyze (null = all accessible) |
+| `topic` | string | `Mistral AI and its products` | Topic to analyze sentiment about |
+| `days` | integer | `7` | Trailing window in days |
+| `start_days_ago` | integer | — | Older boundary (relative) |
+| `end_days_ago` | integer | — | Newer boundary (relative) |
+| `start_date` | string | — | Start of UTC date range |
+| `end_date` | string | — | End of UTC date range |
+| `provider` | string | `mistral` | `mistral` or `claude` |
+| `model` | string | — | Override the default model |
+| `write_google_sheets` | boolean | `false` | Append results to Google Sheets with worksheets `discord_sentiment_summary` and `discord_keyword_mentions` |
+
+## Discord Sentiment Analysis
+
+This app can also analyze sentiment in Discord servers the same way it analyzes Reddit.
+
+### Setup
+
+1. Create a Discord bot and get its token:
+   - Go to [Discord Developer Portal](https://discord.com/developers/applications)
+   - Create a new application
+   - Add a bot user
+   - Copy the token
+
+2. Add the bot to your server with these permissions:
+   - Read Messages/View Channels
+   - Read Message History
+
+3. Set the token in your `.env`:
+   ```
+   DISCORD_BOT_TOKEN=your_bot_token_here
+   ```
+
+### API Usage
+
+Analyze a Discord server via FastAPI:
+
+```bash
+curl -X POST https://your-service.koyeb.app/analyze-discord \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "guild_id": 123456789,
+    "days": 7,
+    "topic": "Your product name",
+    "write_google_sheets": true
+  }'
+```
+
+Analyze specific channels only:
+
+```bash
+curl -X POST https://your-service.koyeb.app/analyze-discord \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "guild_id": 123456789,
+    "channel_ids": [111111111, 222222222],
+    "days": 7,
+    "topic": "Your product name"
+  }'
+```
+
+### MCP Usage
+
+Ask your AI assistant to analyze a Discord server:
+
+- _"Analyze sentiment in Discord guild 123456789 for the last 7 days."_
+- _"What is the sentiment about Mistral AI in channel 111111111?"_
+- _"Run sentiment analysis on Discord guild 123456789 and write to Google Sheets."_
+
+### Google Sheets Setup for Discord
+
+Discord results use separate worksheets by default:
+
+- `discord_sentiment_summary` (instead of `sentiment_summary`)
+- `discord_keyword_mentions` (instead of `keyword_mentions`)
+
+These are created automatically if they don't exist. The column structure is identical to Reddit worksheets.
 
 ## Docker
 
