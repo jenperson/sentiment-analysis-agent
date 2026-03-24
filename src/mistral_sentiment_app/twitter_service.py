@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -59,6 +59,21 @@ def _parse_twitter_datetime(value: str) -> float:
     return datetime.fromisoformat(normalized).timestamp()
 
 
+def _clamp_recent_search_window(start_time: datetime, end_time: datetime) -> tuple[datetime, datetime]:
+    # X recent search rejects windows slightly older than 7 days; keep a safety buffer.
+    now_utc = datetime.now(timezone.utc)
+    latest_allowed_end = now_utc - timedelta(seconds=20)
+    clamped_end = end_time if end_time <= latest_allowed_end else latest_allowed_end
+
+    oldest_allowed_start = now_utc - timedelta(days=6, hours=23, minutes=59)
+    clamped_start = start_time if start_time >= oldest_allowed_start else oldest_allowed_start
+
+    if clamped_start >= clamped_end:
+        clamped_start = clamped_end - timedelta(minutes=1)
+
+    return clamped_start, clamped_end
+
+
 def _search_recent_tweets(
     *,
     bearer_token: str,
@@ -68,6 +83,7 @@ def _search_recent_tweets(
     max_results: int,
     next_token: str | None = None,
 ) -> dict:
+    start_time, end_time = _clamp_recent_search_window(start_time, end_time)
     params = {
         "query": query,
         "start_time": _to_rfc3339(start_time),
@@ -86,7 +102,18 @@ def _search_recent_tweets(
         params=params,
         timeout=30,
     )
-    response.raise_for_status()
+    if not response.ok:
+        detail = response.text
+        try:
+            payload = response.json()
+            detail = str(payload)
+        except Exception:  # noqa: BLE001
+            pass
+        raise RuntimeError(
+            "Twitter recent search request failed: "
+            f"status={response.status_code}, query={query!r}, "
+            f"start_time={params['start_time']}, end_time={params['end_time']}, detail={detail}"
+        )
     return response.json()
 
 

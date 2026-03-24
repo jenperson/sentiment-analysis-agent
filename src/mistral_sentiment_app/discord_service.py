@@ -7,6 +7,7 @@ analyzes sentiment using an LLM, and optionally writes results to Google Sheets.
 
 import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 import discord
@@ -17,8 +18,19 @@ from mistral_sentiment_app.google_sheets_export import (
     DEFAULT_SUMMARY_WORKSHEET,
     write_results_to_google_sheets,
 )
-from mistral_sentiment_app.llm_analysis import DEFAULT_ANALYSIS_TOPIC, analyze_reddit_data
+from mistral_sentiment_app.llm_analysis import (
+    DEFAULT_ANALYSIS_TOPIC,
+    DEFAULT_LLM_PROVIDER,
+    analyze_sentiment,
+)
 from mistral_sentiment_app.models import CommentRecord, PostRecord
+from mistral_sentiment_app.service import (
+    AnalysisOptions,
+    build_result,
+    compute_window,
+    keyword_mentions,
+    load_keywords,
+)
 
 DEFAULT_DISCORD_GUILD_ID: Optional[int] = None  # Will use env or request param
 DEFAULT_DISCORD_CHANNELS: list[int] = []  # Empty = all channels
@@ -135,6 +147,8 @@ async def fetch_discord_data(
     end_days_ago: Optional[int] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
     limit: int = 1000,
 ) -> tuple[list[PostRecord], list[CommentRecord]]:
     """
@@ -157,23 +171,24 @@ async def fetch_discord_data(
     if not token:
         raise RuntimeError("DISCORD_BOT_TOKEN not set")
 
-    now_utc = datetime.now(timezone.utc)
+    if start_time is None or end_time is None:
+        now_utc = datetime.now(timezone.utc)
 
-    if start_date:
-        start_time = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
-    elif start_days_ago is not None:
-        start_time = now_utc - timedelta(days=start_days_ago)
-    elif days is not None:
-        start_time = now_utc - timedelta(days=days)
-    else:
-        start_time = now_utc - timedelta(days=7)
+        if start_date:
+            start_time = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
+        elif start_days_ago is not None:
+            start_time = now_utc - timedelta(days=start_days_ago)
+        elif days is not None:
+            start_time = now_utc - timedelta(days=days)
+        else:
+            start_time = now_utc - timedelta(days=7)
 
-    if end_date:
-        end_time = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
-    elif end_days_ago is not None:
-        end_time = now_utc - timedelta(days=end_days_ago)
-    else:
-        end_time = now_utc
+        if end_date:
+            end_time = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc)
+        elif end_days_ago is not None:
+            end_time = now_utc - timedelta(days=end_days_ago)
+        else:
+            end_time = now_utc
 
     client = DiscordClient(token)
     return await client.fetch_guild_messages(
@@ -194,7 +209,7 @@ def run_discord_analysis(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     topic: str = DEFAULT_ANALYSIS_TOPIC,
-    provider: str = "mistral",
+    provider: str = DEFAULT_LLM_PROVIDER,
     model_override: str = "",
     keywords_file: str = "keywords.txt",
     write_google_sheets: bool = False,
@@ -209,36 +224,87 @@ def run_discord_analysis(
     """
     import asyncio
 
-    messages, replies = asyncio.run(
-        fetch_discord_data(
-            guild_id=guild_id,
-            channel_ids=channel_ids,
+    keywords = load_keywords(Path(keywords_file))
+    window_start, window_end, window_label = compute_window(
+        AnalysisOptions(
             days=days,
             start_days_ago=start_days_ago,
             end_days_ago=end_days_ago,
+            date=None,
             start_date=start_date,
             end_date=end_date,
         )
     )
 
-    if not messages:
-        return {
-            "guild_id": guild_id,
-            "error": "No messages found in the specified time range",
-            "counts": {"messages": 0, "replies": 0},
-        }
+    messages, replies = asyncio.run(
+        fetch_discord_data(
+            guild_id=guild_id,
+            channel_ids=channel_ids,
+            start_time=window_start,
+            end_time=window_end,
+        )
+    )
 
-    result = analyze_reddit_data(
+    mentions = keyword_mentions(keywords=keywords, posts=messages, comments=replies)
+
+    if not messages and not replies:
+        sentiment = {
+            "average_sentiment": None,
+            "summary": "No Discord messages or thread replies were found in the selected window.",
+            "method_notes": "LLM analysis skipped because the Discord fetch returned an empty dataset.",
+        }
+        result = build_result(
+            subreddit_name=f"Discord Guild {guild_id}",
+            window_start=window_start,
+            window_end=window_end,
+            window_label=window_label,
+            posts=messages,
+            comments=replies,
+            sentiment=sentiment,
+            mentions=mentions,
+            analysis_provider=provider,
+            analysis_model=model_override or "",
+            top_posts_method="upvotes",
+        )
+        result["guild_id"] = guild_id
+
+        if write_google_sheets:
+            try:
+                gs_result = write_results_to_google_sheets(
+                    result=result,
+                    spreadsheet_id=google_sheets_spreadsheet_id,
+                    summary_worksheet_name=google_sheets_summary_worksheet,
+                    keywords_worksheet_name=google_sheets_keywords_worksheet,
+                )
+                result["google_sheets_export"] = gs_result
+            except Exception as exc:  # noqa: BLE001
+                result["google_sheets_export"] = {"status": "failed", "error": str(exc)}
+
+        return result
+
+    sentiment, analysis_provider, analysis_model = analyze_sentiment(
         posts=messages,
         comments=replies,
-        subreddit=f"Discord Guild {guild_id}",
-        topic=topic,
+        subreddit_name=f"Discord Guild {guild_id}",
+        window_label=window_label,
         provider=provider,
         model_override=model_override,
-        keywords_file=keywords_file,
+        topic=topic,
+    )
+    result = build_result(
+        subreddit_name=f"Discord Guild {guild_id}",
+        window_start=window_start,
+        window_end=window_end,
+        window_label=window_label,
+        posts=messages,
+        comments=replies,
+        sentiment=sentiment,
+        mentions=mentions,
+        analysis_provider=analysis_provider,
+        analysis_model=analysis_model,
+        top_posts_method="upvotes",
     )
     result["guild_id"] = guild_id
-    result.pop("subreddit", None)
 
     if write_google_sheets:
         try:
