@@ -50,6 +50,7 @@ def analyze_mistral_subreddit(
     google_sheets_spreadsheet_id: str = DEFAULT_GOOGLE_SHEETS_SPREADSHEET_ID,
     google_sheets_summary_worksheet: str = DEFAULT_SUMMARY_WORKSHEET,
     google_sheets_keywords_worksheet: str = DEFAULT_KEYWORDS_WORKSHEET,
+    slack_webhook_url: str = "",
 ) -> dict:
     options = AnalysisOptions(
         subreddit=subreddit,
@@ -71,6 +72,7 @@ def analyze_mistral_subreddit(
         google_sheets_spreadsheet_id=google_sheets_spreadsheet_id,
         google_sheets_summary_worksheet=google_sheets_summary_worksheet,
         google_sheets_keywords_worksheet=google_sheets_keywords_worksheet,
+        slack_webhook_url=slack_webhook_url,
     )
     return run_analysis(options)
 

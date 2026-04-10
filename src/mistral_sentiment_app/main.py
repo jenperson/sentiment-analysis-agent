@@ -63,6 +63,10 @@ def parse_args() -> argparse.Namespace:
         "--google-sheets-keywords-worksheet",
         default=os.getenv("GOOGLE_SHEETS_KEYWORDS_WORKSHEET", DEFAULT_KEYWORDS_WORKSHEET),
     )
+    parser.add_argument(
+        "--slack-webhook-url",
+        default=os.getenv("SLACK_WEBHOOK_URL", ""),
+    )
     return parser.parse_args()
 
 
@@ -87,6 +91,7 @@ def build_options(args: argparse.Namespace) -> AnalysisOptions:
         google_sheets_spreadsheet_id=args.google_sheets_spreadsheet_id,
         google_sheets_summary_worksheet=args.google_sheets_summary_worksheet,
         google_sheets_keywords_worksheet=args.google_sheets_keywords_worksheet,
+        slack_webhook_url=args.slack_webhook_url,
     )
 
 

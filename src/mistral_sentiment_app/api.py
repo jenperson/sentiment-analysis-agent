@@ -41,6 +41,7 @@ class AnalyzeRequest(BaseModel):
     google_sheets_spreadsheet_id: str = DEFAULT_GOOGLE_SHEETS_SPREADSHEET_ID
     google_sheets_summary_worksheet: str = DEFAULT_SUMMARY_WORKSHEET
     google_sheets_keywords_worksheet: str = DEFAULT_KEYWORDS_WORKSHEET
+    slack_webhook_url: str = ""
 
 
 class DiscordAnalyzeRequest(BaseModel):
@@ -113,6 +114,7 @@ def request_to_options(request: AnalyzeRequest) -> AnalysisOptions:
         google_sheets_spreadsheet_id=request.google_sheets_spreadsheet_id,
         google_sheets_summary_worksheet=request.google_sheets_summary_worksheet,
         google_sheets_keywords_worksheet=request.google_sheets_keywords_worksheet,
+        slack_webhook_url=request.slack_webhook_url,
     )
 
 

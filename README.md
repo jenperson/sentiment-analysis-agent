@@ -48,6 +48,10 @@ Optional Google Sheets export:
 - `GOOGLE_SHEETS_KEYWORDS_WORKSHEET=keyword_mentions`
 - `GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE=/absolute/path/to/service-account.json`
 
+Optional Slack export:
+
+- `SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...`
+
 Or use `GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON` instead of a file path.
 For hosted env vars (for example, Koyeb), use compact one-line JSON to avoid formatting issues:
 
@@ -129,6 +133,14 @@ To also write results to Google Sheets:
 uv run mistral-sentiment --days 7 --subreddit MistralAI --output output/weekly_sentiment.json --write-google-sheets
 ```
 
+To also send results to Slack (no extra enable flag required):
+
+```bash
+uv run mistral-sentiment --days 7 --subreddit MistralAI --output output/weekly_sentiment.json --slack-webhook-url "https://hooks.slack.com/services/..."
+```
+
+Or set `SLACK_WEBHOOK_URL` in your environment and run normally.
+
 Optional date range mode (instead of trailing `--days`):
 
 ```bash
@@ -168,6 +180,7 @@ FastAPI request body fields mirror the CLI options, including:
 - `provider`
 - `model`
 - `write_google_sheets`
+- `slack_webhook_url`
 
 Google Sheets worksheets used by default:
 

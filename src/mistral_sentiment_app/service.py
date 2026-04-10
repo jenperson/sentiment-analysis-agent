@@ -23,6 +23,7 @@ from mistral_sentiment_app.google_sheets_export import (
 )
 from mistral_sentiment_app.llm_analysis import DEFAULT_ANALYSIS_TOPIC, DEFAULT_LLM_PROVIDER, analyze_sentiment
 from mistral_sentiment_app.models import CommentRecord, PostRecord
+from mistral_sentiment_app.slack_service import send_analysis_to_slack
 
 REDDIT_BASE_URL = "https://www.reddit.com"
 OLD_REDDIT_BASE_URL = "https://old.reddit.com"
@@ -54,6 +55,7 @@ class AnalysisOptions:
     google_sheets_spreadsheet_id: str = DEFAULT_GOOGLE_SHEETS_SPREADSHEET_ID
     google_sheets_summary_worksheet: str = DEFAULT_SUMMARY_WORKSHEET
     google_sheets_keywords_worksheet: str = DEFAULT_KEYWORDS_WORKSHEET
+    slack_webhook_url: str = ""
 
 
 def parse_utc_date(date_text: str, argument_name: str) -> datetime:
@@ -849,6 +851,13 @@ def run_analysis(options: AnalysisOptions) -> dict:
                 keywords_worksheet_name=options.google_sheets_keywords_worksheet,
             )
 
+        if options.slack_webhook_url:
+            result["slack_export"] = send_analysis_to_slack(
+                result=result,
+                webhook_url=options.slack_webhook_url,
+                topic=options.topic,
+            )
+
         result["crawl_runtime_notes"] = {
             "reddit_block_detected": reddit_block_detected,
             "reddit_rss_fallback_used": rss_fallback_used,
@@ -885,6 +894,13 @@ def run_analysis(options: AnalysisOptions) -> dict:
             spreadsheet_id=options.google_sheets_spreadsheet_id,
             summary_worksheet_name=options.google_sheets_summary_worksheet,
             keywords_worksheet_name=options.google_sheets_keywords_worksheet,
+        )
+
+    if options.slack_webhook_url:
+        result["slack_export"] = send_analysis_to_slack(
+            result=result,
+            webhook_url=options.slack_webhook_url,
+            topic=options.topic,
         )
 
     result["crawl_runtime_notes"] = {
