@@ -77,11 +77,7 @@ def format_sentiment_message(result: dict, topic: str = "Sentiment Analysis") ->
             "block_id": "sentiment_block",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*Overall Sentiment Score:* {sentiment if sentiment is not None else 'N/A'}",
-            },
-            "accessory": {
-                "type": "context_element",
-                "text": {"type": "mrkdwn", "text": sentiment_emoji},
+                "text": f"*Overall Sentiment Score:* {sentiment if sentiment is not None else 'N/A'} {sentiment_emoji}",
             },
         },
     ]
@@ -98,21 +94,21 @@ def format_sentiment_message(result: dict, topic: str = "Sentiment Analysis") ->
     if mentions:
         mentions_text = "*Keyword Mentions:*\n"
         for keyword, data in mentions.items():
-            posts = data.get("post_count", 0)
-            comments = data.get("comment_count", 0)
-            mentions_text += (
-                f"• *{keyword}*: {posts} posts, {comments} comments\n"
-            )
+            count = data.get("count", 0)
+            mentions_text += f"• *{keyword}*: {count} mentions\n"
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": mentions_text}})
 
     # Add top posts
     if top_posts:
         top_posts_text = "*Top 3 Posts by Upvotes:*\n"
         for i, post in enumerate(top_posts[:3], 1):
-            title = post.get("title", "No title")
-            score = post.get("score", 0)
-            url = post.get("url", "#")
-            top_posts_text += f"{i}. <{url}|{title}> ({score} upvotes)\n"
+            content = post.get("content", "No content").splitlines()[0][:100]
+            score = post.get("upvotes", 0)
+            url = post.get("post_link", "")
+            if url:
+                top_posts_text += f"{i}. <{url}|{content}> ({score} upvotes)\n"
+            else:
+                top_posts_text += f"{i}. {content} ({score} upvotes)\n"
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": top_posts_text}})
 
     # Add analysis metadata
@@ -160,7 +156,10 @@ def send_slack_message(
         response.raise_for_status()
         return True
     except requests.exceptions.RequestException as e:
-        print(f"Error sending Slack message: {e}")
+        response_text = ""
+        if hasattr(e, "response") and e.response is not None:
+            response_text = f" | Slack response: {e.response.text}"
+        print(f"Error sending Slack message: {e}{response_text}")
         return False
 
 
