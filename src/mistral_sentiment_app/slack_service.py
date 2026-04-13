@@ -100,7 +100,7 @@ def format_sentiment_message(result: dict, topic: str = "Sentiment Analysis") ->
 
     # Add top posts
     if top_posts:
-        top_posts_text = "*Top 3 Posts by Upvotes:*\n"
+        top_posts_text = "*Most Recent Posts:*\n"
         for i, post in enumerate(top_posts[:3], 1):
             content = post.get("content", "No content").splitlines()[0][:100]
             score = post.get("upvotes", 0)
