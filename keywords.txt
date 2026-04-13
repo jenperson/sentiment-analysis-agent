@@ -1,7 +1,12 @@
 Le Chat
-Mistral Vibe
+Vibe
 Voxtral
 Devstral
 OCR
 Mistral Cloud
 Sandbox
+STT
+Studio
+TTS
+Workflows
+Workflow
